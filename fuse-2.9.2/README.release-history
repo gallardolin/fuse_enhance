@@ -1,0 +1,71 @@
+Version: 2.9.2.7
+Data: 2018/03/19
+Author: Danny/Wing/Scott
+
+1. Remove 2.9.2.5 code
+ - hide_release does not work for same inode ID issue and has a side effect(EX: ddtest)
+2. when kernel fuse want to forget a node in libfuse, need to find a older node which has a same inode id
+3. when inode id of lib fuse is synced from xfs, should set 8 byte inode id to a hidden name. 
+
+=================================================================================================================
+
+Version: 2.9.2.6
+Data: 2018/01/24
+Author: Danny/Wing
+
+1. [33315] kernel space update for supporting partial read/ write on cache mode folder
+    - partial upload Down compatible for 3.0.9
+
+=================================================================================================================
+
+Version: 2.9.2.5
+Data: 2018/01/04
+Author: Danny/Wing
+
+1. Add new fuse operations: hide_delete
+    - libfuse will now notify yas3fs if the incoming unlink command is for delete fuse_hide or not
+    - when libfuse invoke hide_delete, it will forget node to clean metadata
+
+=================================================================================================================
+
+Version: 2.9.2.4
+Data: 2017/12/28
+Author: Danny/Wing
+
+1. Add two fuse opt, syncdelete and syncrmdir
+    - related to Kernel FUSE_OP: FUSE_SYNCDELETE and FUSE_SYNCDRMDIR
+    - allow yas3fs to clean metadata only by calling related IOC cmd
+
+=================================================================================================================
+
+Version: 2.9.2.3
+Data: 2017/12/27
+Author: Danny/Wing
+
+1. Support FUSE inode FOFB: isolate general fuse, ex:NTFS
+
+2. add version: FUSE_2.9.2.3
+ - objdump -xa /usr/lib/libfuse.so.2.9.2 | grep FUSE_2.9.2.
+
+=================================================================================================================
+
+Version: 2.9.2.2
+Data: 2017/12/08
+Author: Danny/Wing
+
+1. Support FUSE inode FOFB
+ - if fuse inode ID and generation does not follow XFS, just return error.
+ - if nlookup > node->nlookup,  nlookup = node->nlookup.
+
+=================================================================================================================
+
+Version: 2.9.2.1
+Data: 2017/11/23
+Author: Danny/Wing
+
+1. Support FUSE inode FOFB
+ - now fuse inode ID and generation will follow XFS
+ - update inode struct to 64 bits
+ - use stat for XFS ino, use FS_IOC_GETVERSION for inode generation
+ - add /mnt/path in struct fuse_fs to store fuse mountpoint
+
