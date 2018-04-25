@@ -486,6 +486,7 @@ __acquires(fc->lock)
 
 static void __fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
 {
+	printk("[%s] req@%d\n", __func__, req->in.h.opcode);
 	BUG_ON(req->background);
 	spin_lock(&fc->lock);
 	if (!fc->connected)

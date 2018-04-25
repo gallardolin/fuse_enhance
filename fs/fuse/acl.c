@@ -20,30 +20,16 @@ static const char* __fuse_acl_type_name(int type)
 	return name;
 }
 
-/*
-* fuse only need to update its mode when accesses its acl
-* , because its lower file system will update by itself.
-*/
 static int fuse_set_mode(struct inode *inode, umode_t mode)
 {
 	int error = 0;
 	
 	if (mode != inode->i_mode) {
-		struct fuse_conn *fc = get_fuse_conn(inode);
 		struct iattr attr;
 		attr.ia_valid = ATTR_MODE | ATTR_CTIME;
 		attr.ia_mode = mode;
 		attr.ia_ctime = current_fs_time(inode->i_sb);
-		
-		if (!(fc->flags & FUSE_DEFAULT_PERMISSIONS))
-			attr.ia_valid |= ATTR_FORCE;
-
-		error = inode_change_ok(inode, &attr);
-		if (!error)
-		{
-			inode->i_mode = (inode->i_mode & S_IFMT) | (attr.ia_mode & 07777);
-			inode->i_ctime = attr.ia_ctime;
-		}
+		error = fuse_do_setattr(inode, &attr, NULL);
 	}
 	return error;
 }
@@ -67,7 +53,7 @@ struct posix_acl *fuse_get_acl(struct inode *inode, int type)
 	
 	
 	/* get the buffer size of extended attribute */
-	size = fuse_getxattr(inode, name, NULL, 0);
+	size = fuse_getxattr(NULL, inode, name, NULL, 0);
 	if (size <= 0)
 		return NULL;
 	
@@ -75,7 +61,7 @@ struct posix_acl *fuse_get_acl(struct inode *inode, int type)
 	if (!value)
 		return ERR_PTR(-ENOMEM);
 	
-	size = fuse_getxattr(inode, name, value, size);
+	size = fuse_getxattr(NULL, inode, name, value, size);
 	if (size > 0) {
 		acl = posix_acl_from_xattr(&init_user_ns, value, size);
 		if (acl && !IS_ERR(acl))
@@ -95,10 +81,10 @@ struct posix_acl *fuse_get_acl(struct inode *inode, int type)
 	return acl;
 }
 
-static int fuse_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+static int fuse_set_acl(struct dentry *entry, struct inode *inode, struct posix_acl *acl, int type)
 {
 	const char *name = __fuse_acl_type_name(type);
-	int error;
+	int error = 0;
 	
 	if(!name)
 		return -EINVAL; 
@@ -110,13 +96,19 @@ static int fuse_set_acl(struct inode *inode, struct posix_acl *acl, int type)
 		value = kmalloc(size, GFP_KERNEL);
 		if (!value)
 			return -ENOMEM;
+
+		printk("[%s] inodeinode@%lu gen@%u error111@%d\n", __func__, inode->i_ino, inode->i_generation, error);
 		
 		posix_acl_to_xattr(&init_user_ns, acl, value, size);
-		error = fuse_setxattr(inode, name, value, size, 0);
+		error = fuse_setxattr(entry, inode, name, value, size, 0);
+		printk("[%s] inodeinode@%lu gen@%u error111.5@%d\n", __func__, inode->i_ino, inode->i_generation, error);
 		kfree(value);
 	}
 	else
-		error = fuse_removexattr(inode, name);
+	{
+		printk("[%s] inodeinode@%lu gen@%u error222@%d\n", __func__, inode->i_ino, inode->i_generation, error);
+		error = fuse_removexattr(entry, inode, name);
+	}
 	
 	if (!error)
 	{
@@ -127,34 +119,48 @@ static int fuse_set_acl(struct inode *inode, struct posix_acl *acl, int type)
 	return error;
 }
 
-int fuse_inherit_acl(struct inode *inode, struct posix_acl *acl)
+int fuse_inherit_acl(struct dentry *entry, struct inode *inode, struct posix_acl *acl)
 {
+	struct fuse_conn *fc = get_fuse_conn(inode);
 	umode_t mode = inode->i_mode;
 	int error = 0;
 	
 	if (!acl)
 		goto out_release;
+
+	printk("[%s] inodeinode@%lu gen@%u start1 error@%d\n", __func__, inode->i_ino, inode->i_generation, error);
 	if (S_ISDIR(inode->i_mode)) {
-		error = fuse_set_acl(inode, acl, ACL_TYPE_DEFAULT);
+		error = fuse_set_acl(entry, inode, acl, ACL_TYPE_DEFAULT);
 		if (error)
 			goto out_release;
 	}
 	
+	printk("[%s] inodeinode@%lu gen@%u start2 error@%d\n", __func__, inode->i_ino, inode->i_generation, error);
 	error = posix_acl_create(&acl, GFP_KERNEL, &mode);
 	if (error < 0)
 		return error;
+
+	printk("[%s] inodeinode@%lu gen@%u start3 error@%d\n", __func__, inode->i_ino, inode->i_generation, error);
+	if (fc->iscache && fc->mount_path)
+	{
+		error = 0;
+	}
+	else
+		error = fuse_set_mode(inode, mode);
 	
-	error = fuse_set_mode(inode, mode);
 	if (error)
 		goto out_release;
 
-	error = fuse_set_acl(inode, acl, ACL_TYPE_ACCESS);
+	printk("[%s] inodeinode@%lu gen@%u start4 error@%d\n", __func__, inode->i_ino, inode->i_generation, error);
+	error = fuse_set_acl(entry, inode, acl, ACL_TYPE_ACCESS);
 out_release:
+	printk("[%s] inodeinode@%lu gen@%u start5 error@%d\n", __func__, inode->i_ino, inode->i_generation, error);
 	posix_acl_release(acl);
+	printk("[%s] inodeinode@%lu gen@%u start6 error@%d\n", __func__, inode->i_ino, inode->i_generation, error);
 	return error;
 }
 
-int fuse_acl_chmod(struct inode *inode)
+int fuse_acl_chmod(struct dentry *entry, struct inode *inode)
 {
 	struct posix_acl *acl;
 	int error;
@@ -167,7 +173,7 @@ int fuse_acl_chmod(struct inode *inode)
 	if (error)
 		return error;
 	
-	error = fuse_set_acl(inode, acl, ACL_TYPE_ACCESS);
+	error = fuse_set_acl(entry, inode, acl, ACL_TYPE_ACCESS);
 	posix_acl_release(acl);
 	return error;
 }
@@ -200,7 +206,7 @@ IS_CACHE_FLOW:
 		 * If the ACL is valid, cache it.
 		 */
 		name = __fuse_acl_type_name(type);
-		error = name ? fuse_getxattr(inode, name, value, size) : -EINVAL;
+		error = name ? fuse_getxattr(entry, inode, name, value, size) : -EINVAL;
 		
 		acl = error < 0 ? NULL : posix_acl_from_xattr(&init_user_ns, value, size);
 		if (acl && !IS_ERR(acl)) {
@@ -228,7 +234,7 @@ static int fuse_xattr_acl_set(struct dentry *entry, const char *name,
 		return -EPERM;
 	
 	if (!value)
-		return fuse_set_acl(inode, acl, type);
+		return fuse_set_acl(entry, inode, acl, type);
 	
 	acl = posix_acl_from_xattr(&init_user_ns, value, size);
 	if (!acl || IS_ERR(acl))
@@ -239,7 +245,7 @@ static int fuse_xattr_acl_set(struct dentry *entry, const char *name,
 		goto out_release;
 	
 	name = __fuse_acl_type_name(type);
-	error = name ? fuse_setxattr(inode, name, value, size, flags) : -EINVAL;
+	error = name ? fuse_setxattr(entry, inode, name, value, size, flags) : -EINVAL;
 	if (error)
 		goto out_release;
 	

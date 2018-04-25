@@ -1677,10 +1677,34 @@ static void do_bmap(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 
 static void do_ioctl(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 {
+	struct fuse_file_info fi;
+	struct fuse *f = req_fuse_prepare(req);
+	struct fuse_ioctl_in *arg = NULL;
+	unsigned int flags;
+	void *in_buf = NULL;
+	char *path1 = NULL, *path2 = NULL;
+	int *special;
+	if(is_yas3(f) == 1)
+	{
+		special = (int *) inarg;
+		path1 = PARAM(special);
+		path2 = (char *) (path1 + strlen(path1) + 1);
+		arg = (struct fuse_rename_in *)(path2 + strlen(path2) + 1);
+		yase_logs("[do_ioctl] path1@%s len1@%d path2@%s len2@%d special@%d\n"
+			, path1, strlen(path1), path2, strlen(path2), *special);
+	}
+	else
+	{
+		arg = (struct fuse_ioctl_in *) inarg;
+	}
+	
+	flags = arg->flags;
+	in_buf = arg->in_size ? PARAM(arg) : NULL;
+	/*
 	struct fuse_ioctl_in *arg = (struct fuse_ioctl_in *) inarg;
 	unsigned int flags = arg->flags;
 	void *in_buf = arg->in_size ? PARAM(arg) : NULL;
-	struct fuse_file_info fi;
+	*/
 
 	if (flags & FUSE_IOCTL_DIR &&
 	    !(req->f->conn.want & FUSE_CAP_IOCTL_DIR)) {
@@ -1696,8 +1720,17 @@ static void do_ioctl(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 	    !(flags & FUSE_IOCTL_32BIT)) {
 		req->ioctl_64bit = 1;
 	}
-
-	if (req->f->op.ioctl)
+	yase_logs("[do_ioctl] special@%d \n", (req->f->op.ioctl_special)?1:0);
+	
+	if(is_yas3(f) == 1 && req->f->op.ioctl_special && *special == 1)
+	{
+		yase_logs("[do_ioctl] first special@%d path@%s\n", (req->f->op.ioctl_special)?1:0, path1);
+		req->f->op.ioctl_special(req, path1, arg->cmd,
+				 (void *)(uintptr_t)arg->arg, &fi, flags,
+				 in_buf, arg->in_size, arg->out_size);
+		yase_logs("[do_ioctl] end special@%d path@%s\n", (req->f->op.ioctl_special)?1:0, path1);
+	}
+	else if (req->f->op.ioctl)
 		req->f->op.ioctl(req, nodeid, arg->cmd,
 				 (void *)(uintptr_t)arg->arg, &fi, flags,
 				 in_buf, arg->in_size, arg->out_size);
@@ -2467,7 +2500,11 @@ static void fuse_ll_process_buf(void *data, const struct fuse_buf *buf,
 	else if (in->opcode == FUSE_NOTIFY_REPLY)
 		do_notify_reply(req, in->nodeid, inarg, buf);
 	else
+	{
+		yase_logs("[ll_process] start opname@%s\n", opname(in->opcode));
 		fuse_ll_ops[in->opcode].func(req, in->nodeid, inarg);
+		yase_logs("[ll_process] end opname@%s\n", opname(in->opcode));
+	}
 
 out_free:
 	free(mbuf);

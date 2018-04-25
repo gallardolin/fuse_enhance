@@ -4,7 +4,7 @@ static int fuse_xattr_get(struct dentry *entry, const char *name,
 			     void *value, size_t size, int xflags)
 {
 	struct inode *inode = entry->d_inode;
-	return fuse_getxattr(inode, name, value, size);
+	return fuse_getxattr(entry, inode, name, value, size);
 }
 
 static int fuse_xattr_set(struct dentry *entry, const char *name,
@@ -12,9 +12,9 @@ static int fuse_xattr_set(struct dentry *entry, const char *name,
 {
 	struct inode *inode = entry->d_inode;
 	if (!value)
-		return fuse_removexattr(inode, name);
+		return fuse_removexattr(entry, inode, name);
 		
-	return fuse_setxattr(inode, name, value, size, flags);
+	return fuse_setxattr(entry, inode, name, value, size, flags);
 }
 
 static const struct xattr_handler fuse_xattr_handler = {

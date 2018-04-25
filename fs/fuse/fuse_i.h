@@ -49,13 +49,18 @@
 #define FUSE_REQ_INLINE_PAGES 1
 
 /** FUSE module version */
-#define DRV_VERSION "1.0.17"
+#define DRV_VERSION "1.0.14"
 
 /** YAS3 IOC to notify io range*/
 #define YAS3FS_IOC_SET_DIRTY _IOW('F', 8, yas3fs_dirty_range_t)
 #define YAS3FS_IOC_SET_DIRTY_MULTI _IOW('F', 8, yas3fs_dirty_range_t)
 #define YAS3FS_N_DIRTY 10
 #define YAS3FS_DIRTY_FRAG 10485760
+
+#define SYNC_READ_FROM_PAGE 0
+#define SYNC_WRITE_FROM_PAGE 1
+#define SYNC_READ_FROM_BUF 2
+#define SYNC_WRITE_FROM_BUF 3
 
 /** List of active connections */
 extern struct list_head fuse_conn_list;
@@ -702,7 +707,7 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
 			u64 attr_valid, u64 attr_version);
 
 int fuse_lookup_name(struct super_block *sb, u64 nodeid, struct qstr *name,
-		     struct fuse_entry_out *outarg, struct inode **inode);
+		     struct fuse_entry_out *outarg, struct inode **inode, struct inode *parent, struct dentry *entry);
 
 /**
  * Send FORGET command
@@ -901,7 +906,7 @@ int fuse_allow_current_process(struct fuse_conn *fc);
 u64 fuse_lock_owner_id(struct fuse_conn *fc, fl_owner_t id);
 
 int fuse_update_attributes(struct inode *inode, struct kstat *stat,
-			   struct file *file, bool *refreshed);
+			   struct file *file, bool *refreshed, struct dentry *entry);
 
 void fuse_flush_writepages(struct inode *inode);
 
@@ -946,11 +951,11 @@ void fuse_write_update_size(struct inode *inode, loff_t pos);
 int fuse_do_setattr(struct inode *inode, struct iattr *attr,
 		    struct file *file);
 
-int fuse_setxattr(struct inode *inode, const char *name,
+int fuse_setxattr(struct dentry *entry, struct inode *inode, const char *name,
 			 const void *value, size_t size, int flags);
-ssize_t fuse_getxattr(struct inode *inode, const char *name,
+ssize_t fuse_getxattr(struct dentry *entry, struct inode *inode, const char *name,
 			     void *value, size_t size);
-int fuse_removexattr(struct inode *inode, const char *name);
+int fuse_removexattr(struct dentry *entry, struct inode *inode, const char *name);
 struct list_head *init_shared_list(char *mount_path);
 void free_shared_bucket_list(struct list_head *shared_bucket_list);
 int check_ACM_share_list_with_path(struct inode *inode, char *fullpath);
@@ -962,16 +967,21 @@ extern const struct xattr_handler *fuse_xattr_handlers[];
 extern const struct xattr_handler fuse_xattr_acl_access_handler;
 extern const struct xattr_handler fuse_xattr_acl_default_handler;
 
-int fuse_acl_chmod(struct inode *inode);
-int fuse_inherit_acl(struct inode *inode, struct posix_acl *acl);
+int fuse_acl_chmod(struct dentry *entry, struct inode *inode);
+int fuse_inherit_acl(struct dentry *entry,  struct inode *inode, struct posix_acl *acl);
 struct posix_acl *fuse_get_acl(struct inode *inode, int type);
+char* path_translate(char *path);
+char *fuse_prepare_path(struct fuse_conn *fc, struct dentry *entry, char *buf);
+void fuse_set_encode_info(struct dentry *entry, struct inode *inode);
+void _fuse_copy_attr_to_arg(struct file *file, struct fuse_attr *attr);
+
 #else
 static inline struct posix_acl *fuse_get_acl(struct inode *inode, int type)
 {
 	return NULL;
 }
-#define fuse_acl_chmod(inode)				0
-#define fuse_inherit_acl(inode, acl)		0
+#define fuse_acl_chmod(entry, inode)				0
+#define fuse_inherit_acl(entry, inode, acl)		0
 #endif
 
 int update_dirty(struct inode *inode, char *path, loff_t start, loff_t end,

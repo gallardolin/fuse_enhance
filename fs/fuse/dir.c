@@ -242,6 +242,9 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 		kfree(forget);
 		if (err || (outarg.attr.mode ^ inode->i_mode) & S_IFMT)
 			goto invalid;
+		
+		if(outarg.attr.size == 0 && inode->i_ino != 0)
+			outarg.attr.size = inode->i_size;
 
 		fuse_change_attributes(inode, &outarg.attr,
 				       entry_attr_timeout(&outarg),
@@ -280,9 +283,202 @@ int fuse_valid_type(int m)
 	return S_ISREG(m) || S_ISDIR(m) || S_ISLNK(m) || S_ISCHR(m) ||
 		S_ISBLK(m) || S_ISFIFO(m) || S_ISSOCK(m);
 }
+void _fuse_copy_attr_to_arg(struct file *file, struct fuse_attr *attr)
+{
+	if(!IS_ERR(file))
+	{
+		attr->ino = file->f_inode->i_ino;
+		attr->size = i_size_read(file->f_inode);
+		attr->blocks = file->f_inode->i_blocks;
+		attr->atime = file->f_inode->i_atime.tv_sec;
+		attr->mtime = file->f_inode->i_mtime.tv_sec;
+		attr->ctime = file->f_inode->i_ctime.tv_sec;
+		attr->atimensec = file->f_inode->i_atime.tv_nsec;
+		attr->mtimensec = file->f_inode->i_mtime.tv_nsec;
+		attr->ctimensec = file->f_inode->i_ctime.tv_nsec;
+		attr->mode = file->f_inode->i_mode;
+		attr->nlink = file->f_inode->i_nlink;
+		attr->uid = file->f_inode->i_uid.val;
+		attr->gid = file->f_inode->i_gid.val;
+		attr->rdev = file->f_inode->i_rdev;
+		attr->blksize = (1 << file->f_inode->i_blkbits);
+		attr->padding = 0;
+	}
+}
+void fuse_copy_attr_to_arg(struct file *file, struct fuse_entry_out *arg)
+{
+	if(!IS_ERR(file))
+	{
+		arg->nodeid = file->f_inode->i_ino;
+		arg->generation = file->f_inode->i_generation;
+		
+		_fuse_copy_attr_to_arg(file, &arg->attr);
+	}
+}
+
+int fuse_lookup_by_local_fs(struct inode *parent, struct dentry *entry, struct fuse_entry_out *outarg)
+{
+	struct file *cache_file = NULL;
+	char *path, *full_path = NULL, *real_path;
+	
+	path = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!path)
+		return -EIO;
+
+	memset(path, 0, PATH_MAX);
+
+	translate_path_from_dentry(parent, entry, path);
+
+	printk("[%s] path@%s len@%ld\n", __func__, path, strlen(path));
+
+	full_path= path + (PATH_MAX - strlen(path) - 1);
+
+	memcpy(full_path, path, (strlen(path) + 1));
+
+	memset(path, 0, (strlen(path) + 1));
+
+	printk("[%s] fullpath@%s len@%ld\n", __func__, full_path, strlen(full_path));
+
+	if (!full_path)
+		goto free_path_normal;
+
+	real_path = path_translate(full_path);
+	if (!real_path)
+		goto free_path_normal;
+
+	printk("[%s] real_path@%s len@%ld\n", __func__, real_path, strlen(real_path));
+
+	cache_file = filp_open(real_path, O_RDONLY | O_LARGEFILE, 0);
+	if(IS_ERR(cache_file))
+	{
+		printk("[%s] ferr111@%ld\n", __func__, PTR_ERR(cache_file));
+		cache_file = filp_open(real_path, O_DIRECTORY, 0);
+	}
+	
+	if (IS_ERR(cache_file))
+	{
+		printk("[%s] ferr222@%ld\n", __func__, PTR_ERR(cache_file));
+		goto free_cache_normal;
+	}
+
+	fuse_copy_attr_to_arg(cache_file, outarg);	
+
+	printk("[%s] real_path1@%s full_path@%s name@%s nodeid@%llu generation@%llu\n"
+		, __func__, real_path, full_path, entry->d_name.name, outarg->nodeid, outarg->generation);
+
+	fput(cache_file);
+
+free_cache_normal:
+	kfree(real_path);
+free_path_normal:
+	kfree(path);
+
+	return 0;
+
+}
+
+char *fuse_prepare_path(struct fuse_conn *fc, struct dentry *entry, char *buf)
+{
+	char *path;
+	buf = kmalloc(PATH_MAX, GFP_KERNEL);
+	if(!buf)
+	{
+		printk("[%s] has no memory to alloc buf\n", __func__);
+		goto fail_alloc;
+	}
+
+	memset(buf, 0 , PATH_MAX);
+	path = dentry_path_raw(entry, buf, PATH_MAX);
+	if (IS_ERR(path))
+	{
+		printk("[%s] path has a err: %ld\n", __func__, PTR_ERR(path));
+		goto fail_prepare_path;
+	}
+
+	path = path - strlen(fc->mount_path);
+	memcpy(path, fc->mount_path, strlen(fc->mount_path));
+	return path;
+	
+fail_prepare_path:
+	kfree(buf);
+fail_alloc:
+	return NULL;
+}
+
+int travels_cache_path(struct fuse_conn *fc, char *real_path, struct fuse_entry_out *outarg)
+{
+	struct file *cache_file = NULL;
+	char *nowptr = real_path;
+	char *travels_path = kmalloc(strlen(real_path) + 1, GFP_KERNEL);
+	int err = 0, i = 0;
+
+	if (!travels_path)
+		return -1;
+
+	memset(travels_path, 0, strlen(real_path) + 1);
+
+	for(i=0; i<4; i++) {
+		nowptr = strchr(nowptr, '/');
+		if (!nowptr)
+		{
+			err = -1;
+			goto free_exit;
+		}
+		nowptr++;
+	}
+
+	while(nowptr)
+	{
+		//printk("[%s] nowptr@%s real@%s\n", __func__, nowptr, real_path);
+		memcpy(travels_path, real_path, (nowptr - real_path + 1 - 2));
+		nowptr = strchr(nowptr, '/');
+		if(nowptr)
+		{
+			nowptr++;
+			//printk("[%s] nowptr+1@%s len@%lu real@%s\n", __func__, nowptr, (nowptr - real_path + 1), real_path);
+		}
+		else
+		{
+			//printk("[%s] nowptr@%s len@%lu real@%s\n", __func__, nowptr, (nowptr - real_path + 1), real_path);
+		}
+		
+		cache_file = filp_open(travels_path, O_DIRECTORY, 0);
+		if (IS_ERR(cache_file))
+		{
+			printk("[%s] travels_path@%s real@%s open failed\n", __func__, travels_path, real_path);
+			err = -1;
+			goto free_exit;
+		}
+		else
+		{
+			//printk("[%s] travels_path@%s real@%s\n", __func__, travels_path, real_path);
+		}
+
+		if(!nowptr && outarg)
+		{
+			fuse_copy_attr_to_arg(cache_file, outarg);
+			//printk("[%s] id@%llu gen@%llu\n", __func__, outarg->nodeid, outarg->generation);
+
+		}
+
+		fput(cache_file);
+	}
+
+free_exit:
+	kfree(travels_path);
+	return err;
+	/*
+	cache_file = filp_open(real_path, O_RDONLY | O_LARGEFILE, 0);
+	if(IS_ERR(cache_file))
+	{
+		printk("[%s] ferr111@%ld\n", __func__, PTR_ERR(cache_file));
+		cache_file = filp_open(real_path, O_DIRECTORY, 0);
+	}
+	*/
+}
 
 int fuse_lookup_name(struct super_block *sb, u64 nodeid, struct qstr *name,
-		     struct fuse_entry_out *outarg, struct inode **inode)
+		     struct fuse_entry_out *outarg, struct inode **inode, struct inode *parent, struct dentry *entry)
 {
 	struct fuse_conn *fc = get_fuse_conn_super(sb);
 	struct fuse_req *req;
@@ -310,7 +506,44 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, struct qstr *name,
 	attr_version = fuse_get_attr_version(fc);
 
 	fuse_lookup_init(fc, req, nodeid, name, outarg);
-	fuse_request_send(fc, req);
+
+	/*
+	if(entry && parent)
+	{
+		req->out.h.error = fuse_lookup_by_local_fs(parent, entry, outarg);
+	}
+	else */if(entry)//parent == NULL && entry
+	{
+		char *buf = NULL, *path = NULL;
+		char *real_path = NULL;
+		int err = 0;
+		if(parent == NULL)
+			printk("[%s] test start111 for \n", __func__);
+
+		path = fuse_prepare_path(fc, entry, buf);
+		if(!path)
+			goto drop_path;
+		
+		real_path = path_translate(path);
+		if(!real_path)
+			goto drop_path;
+
+		if(parent == NULL)
+			printk("[%s] test start111 realpath@%s\n", __func__, real_path);
+
+		err = travels_cache_path(fc, real_path, outarg);
+
+		kfree(real_path);
+drop_path:
+		if(buf)
+			kfree(buf);
+	}
+
+//	else
+	{
+		fuse_request_send(fc, req);	
+	}
+
 	err = req->out.h.error;
 	fuse_put_request(fc, req);
 	/* Zero nodeid is same as -ENOENT, but with valid timeout */
@@ -326,8 +559,23 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, struct qstr *name,
 	*inode = fuse_iget(sb, outarg->nodeid, outarg->generation,
 			   &outarg->attr, entry_attr_timeout(outarg),
 			   attr_version);
+	/*
+	if(entry && parent)
+	{
+		struct fuse_inode *fi= get_fuse_inode(*inode);
+		spin_lock(&fc->lock);
+		fi->nlookup--;
+		spin_unlock(&fc->lock);
+
+		printk("[%s] id@%llu find@%d nlookup@%lld\n", __func__, outarg->nodeid, (*inode)?1:0, fi->nlookup);
+	}
+	*/
 	err = -ENOMEM;
 	if (!*inode) {
+		if(entry && parent)
+		{
+			//printk("[%s] id1@%llu find@%d\n", __func__, outarg->nodeid, (*inode)?1:0);
+		}
 		fuse_queue_forget(fc, forget, outarg->nodeid, 1);
 		goto out;
 	}
@@ -336,6 +584,10 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, struct qstr *name,
  out_put_forget:
 	kfree(forget);
  out:
+ 	if(entry && parent)
+	{
+		//printk("[%s] id2@%llu find@%d err@%d\n", __func__, outarg->nodeid, (*inode)?1:0, err);
+	}
 	return err;
 }
 
@@ -367,7 +619,7 @@ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
 	bool outarg_valid = true;
 
 	err = fuse_lookup_name(dir->i_sb, get_node_id(dir), &entry->d_name,
-			       &outarg, &inode);
+			       &outarg, &inode, dir, entry);
 	if (err == -ENOENT) {
 		outarg_valid = false;
 		err = 0;
@@ -391,6 +643,10 @@ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
 		fuse_invalidate_entry_cache(entry);
 
 	fuse_advise_use_readdirplus(dir);
+	if(entry && dir)
+	{
+		//printk("[%s] id*@%llu outarg_valid@%d\n", __func__, outarg.nodeid, outarg_valid);
+	}
 	return newent;
 
  out_iput:
@@ -418,7 +674,8 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	struct fuse_open_out outopen;
 	struct fuse_entry_out outentry;
 	struct fuse_file *ff;
-	struct posix_acl *default_acl = fuse_get_acl(dir, ACL_TYPE_DEFAULT);;
+	struct posix_acl *default_acl = fuse_get_acl(dir, ACL_TYPE_DEFAULT);
+	int success = 0;
 
 	/* Userspace expects S_IFREG in create mode */
 	BUG_ON((mode & S_IFMT) != S_IFREG);
@@ -467,8 +724,50 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	req->out.args[0].value = &outentry;
 	req->out.args[1].size = sizeof(outopen);
 	req->out.args[1].value = &outopen;
-	fuse_request_send(fc, req);
-	err = req->out.h.error;
+
+	
+	if (fc->iscache && fc->mount_path)
+	{
+		struct file *cache_file = NULL;
+		char *real_path = NULL;
+		char *buf = NULL, *path = NULL;
+	
+		path = fuse_prepare_path(fc, entry, buf);
+		if(!path)
+			goto drop_path;
+			
+		real_path = path_translate(path);
+		if(!real_path)
+			goto drop_path;
+
+		cache_file = filp_open(real_path, flags, mode);
+		if (IS_ERR(cache_file))
+			goto free_cache_normal;
+
+		fuse_copy_attr_to_arg(cache_file, &outentry);
+
+		outopen.fh = 0;
+		outopen.open_flags = 1;
+
+		fput(cache_file);
+
+		success = 1;
+
+free_cache_normal:
+		kfree(real_path);
+drop_path:
+		if(buf)
+			kfree(buf);
+	}
+	
+	if(!success)
+	{
+		fuse_request_send(fc, req);
+		err = req->out.h.error;
+	}
+	else
+		err = 0;
+	
 	if (err)
 		goto out_free_ff;
 
@@ -477,11 +776,13 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 		goto out_free_ff;
 
 	fuse_put_request(fc, req);
+	printk("[%s] fh@%llu flags@%u =@%u\n", __func__, outopen.fh, outopen.open_flags, flags);
 	ff->fh = outopen.fh;
 	ff->nodeid = outentry.nodeid;
 	ff->open_flags = outopen.open_flags;
 	inode = fuse_iget(dir->i_sb, outentry.nodeid, outentry.generation,
 			  &outentry.attr, entry_attr_timeout(&outentry), 0);
+	printk("[%s] fh@%llu flags@%llu\n", __func__, ff->nodeid, outentry.generation);
 	if (!inode) {
 		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
 		fuse_sync_release(ff, flags);
@@ -490,21 +791,26 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 		goto out_acl_release;
 	}
 	kfree(forget);
-	err = fuse_inherit_acl(inode, default_acl);
+	printk("[%s] fh@%llu flags@%llu end111\n", __func__, ff->nodeid, outentry.generation);
+	err = fuse_inherit_acl(entry, inode, default_acl);
 	if (unlikely(err)) {
 		iput(inode);
 		goto out_err;
 	}
+	printk("[%s] fh@%llu flags@%llu end111.5\n", __func__, ff->nodeid, outentry.generation);
 	d_instantiate(entry, inode);
 	fuse_change_entry_timeout(entry, &outentry);
 	fuse_invalidate_attr(dir);
+	printk("[%s] fh@%llu flags@%llu end111.6\n", __func__, ff->nodeid, outentry.generation);
 	err = finish_open(file, entry, generic_file_open, opened);
+	printk("[%s] fh@%llu flags@%llu end222@%d\n", __func__, ff->nodeid, outentry.generation ,err);
 	if (err) {
 		fuse_sync_release(ff, flags);
 	} else {
 		file->private_data = fuse_file_get(ff);
 		fuse_finish_open(inode, file);
 	}
+	printk("[%s] fh@%llu flags@%llu end222.5@%d\n", __func__, ff->nodeid, outentry.generation ,err);
 	return err;
 
 out_free_ff:
@@ -630,7 +936,7 @@ static int create_new_entry(struct fuse_conn *fc, struct fuse_req *req,
 		return -ENOMEM;
 	}
 	kfree(forget);
-	err = fuse_inherit_acl(inode, default_acl);
+	err = fuse_inherit_acl(entry, inode, default_acl);
 	if (unlikely(err)) {
 		iput(inode);
 		return err;
@@ -872,6 +1178,71 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
 		fuse_invalidate_entry(entry);
 	return err;
 }
+int fuse_lower_rename(unsigned int flags, struct dentry *olddir
+	, struct dentry *newdir, char *oldname, char *newname)
+{
+	struct dentry *odentry, *ndentry;
+	struct dentry *trap = lock_rename(olddir, newdir);
+	int err = 0;
+	odentry = lookup_one_len(oldname, olddir, strlen(oldname));
+	err = PTR_ERR(odentry);
+	if (IS_ERR(odentry))
+	{
+		printk("[%s] err111@%d", __func__, err);
+		goto out_err;
+	}
+
+	err = -ENOENT;
+	if (!odentry->d_inode)
+	{
+		printk("[%s] err112@%d", __func__, err);
+		goto out_dput_old;
+	}
+	err = -EINVAL;
+	if (odentry == trap)
+	{
+		printk("[%s] err113@%d", __func__, err);
+		goto out_dput_old;
+	}
+
+	ndentry = lookup_one_len(newname, newdir, strlen(newname));	
+	err = PTR_ERR(ndentry);
+	if (IS_ERR(ndentry))
+	{
+		printk("[%s] err114@%d", __func__, err);
+		goto out_dput_old;
+	}
+	err = -ENOTEMPTY;
+	if (ndentry == trap)
+	{
+		printk("[%s] err115@%d", __func__, err);
+		goto out_dput_new;
+	}
+
+	err = vfs_rename(olddir->d_inode, odentry, newdir->d_inode, ndentry, NULL, flags);
+	if(!err)
+	{
+		err = sync_inode_metadata(olddir->d_inode, 1);
+		if(!err)
+		{
+			err = sync_inode_metadata(newdir->d_inode, 1);
+			if(err)
+				printk("[%s] err118@%d", __func__, err);
+		}
+		else
+			printk("[%s] err117@%d", __func__, err);
+	}
+	else
+		printk("[%s] err116@%d", __func__, err);
+
+out_dput_new:
+	dput(ndentry);
+out_dput_old:
+	dput(odentry);
+out_err:
+	unlock_rename(olddir, newdir);
+	return err;
+}
 
 static int fuse_rename_common(struct inode *olddir, struct dentry *oldent,
 			      struct inode *newdir, struct dentry *newent,
@@ -883,6 +1254,7 @@ static int fuse_rename_common(struct inode *olddir, struct dentry *oldent,
 	struct fuse_req *req;
 	char *full_path;
 	int checklist;
+	int success = 0;
 
 	if(check_iscache(newdir)){
         full_path = kmalloc(PATH_MAX, GFP_KERNEL);
@@ -911,7 +1283,155 @@ static int fuse_rename_common(struct inode *olddir, struct dentry *oldent,
 	req->in.args[1].value = oldent->d_name.name;
 	req->in.args[2].size = newent->d_name.len + 1;
 	req->in.args[2].value = newent->d_name.name;
-	fuse_request_send(fc, req);
+
+	if (fc->iscache && fc->mount_path)
+	{
+		char *buf_olddir = NULL, *path_olddir =NULL;
+		char *buf_newdir = NULL, *path_newdir =NULL;
+		struct dentry *fuse_dentry_olddir = oldent->d_parent;
+		struct dentry *fuse_dentry_newdir = newent->d_parent;
+		struct file *cache_file_olddir = NULL;
+		struct file *cache_file_newdir = NULL;
+		char *real_path_olddir = NULL;
+		char *real_path_newdir = NULL;
+
+		
+		if(oldent)
+			printk("[%s] oldent@%s=%s ino@%lu gen@%u\n"
+				, __func__, oldent->d_iname, oldent->d_name.name, oldent->d_inode->i_ino, oldent->d_inode->i_generation);
+		
+		if(newent)
+		{
+			printk("[%s] newent@%s=%s parent@%s\n"
+				, __func__, newent->d_iname, newent->d_name.name, (newent->d_parent)? (char *)newent->d_parent->d_iname: (char *)"hekko");
+			if(newent->d_inode)
+				printk("[%s] newent@%s=%s ino@%lu gen@%u\n"
+				, __func__, newent->d_iname, newent->d_name.name, newent->d_inode->i_ino, newent->d_inode->i_generation);
+		}
+		
+
+		if(fuse_dentry_olddir)
+		{
+			path_olddir = fuse_prepare_path(fc, fuse_dentry_olddir, buf_olddir);
+			if(!path_olddir)
+				goto drop_path;
+
+			printk("[%s] TESTT old@%s\n", __func__, path_olddir);
+			
+			real_path_olddir = path_translate(path_olddir);
+			if(!real_path_olddir)
+				goto drop_path;
+
+			printk("[%s] TESTT old@%s real@%s\n", __func__, path_olddir, real_path_olddir);
+
+			cache_file_olddir = filp_open(real_path_olddir, O_DIRECTORY, 0);
+
+			if (IS_ERR(cache_file_olddir))
+				goto free_cache_normal;
+		}
+
+		if(olddir != newdir && fuse_dentry_newdir)
+		{
+			path_newdir = fuse_prepare_path(fc, fuse_dentry_newdir, buf_newdir);
+			if(!path_newdir)
+				goto drop_path;
+			
+			printk("[%s] TESTT new@%s\n", __func__, path_newdir);
+
+			real_path_newdir = path_translate(path_newdir);
+			if(!real_path_newdir)
+				goto drop_path;
+
+			printk("[%s] TESTT new@%s real@%s\n", __func__, path_newdir, real_path_newdir);
+
+			cache_file_newdir = filp_open(real_path_newdir, O_DIRECTORY, 0);
+
+			if (IS_ERR(cache_file_newdir))
+				goto free_cache_normal;
+		}
+
+		req->out.h.error = fuse_lower_rename(flags, cache_file_olddir->f_dentry
+									, (cache_file_newdir)? cache_file_newdir->f_dentry: cache_file_olddir->f_dentry
+									, oldent->d_iname, newent->d_iname);
+	
+		printk("[%s] TESTT oldent@%s=%s ino@%lu gen@%u err@%d\n"
+				, __func__, oldent->d_iname, oldent->d_name.name
+				, oldent->d_inode->i_ino, oldent->d_inode->i_generation
+				, req->out.h.error);
+			
+free_cache_normal:
+		if(real_path_olddir)
+			kfree(real_path_olddir);
+		if(real_path_newdir)
+			kfree(real_path_newdir);
+drop_path:
+		if(buf_olddir)
+			kfree(buf_olddir);
+		if(buf_newdir)
+			kfree(buf_newdir);
+
+		if(cache_file_olddir && !IS_ERR(cache_file_olddir))
+			fput(cache_file_olddir);
+		if(cache_file_newdir && !IS_ERR(cache_file_newdir))
+			fput(cache_file_newdir);
+		
+		if(!req->out.h.error)
+			success = 1;
+
+		//char *buf_oldent = NULL, *path_oldent =NULL;
+		//struct file *cache_file_olddir = NULL;
+		/*
+		char *buf_olddir = NULL, *path_olddir =NULL;
+		struct dentry *fuse_dentry_olddir;
+		struct file *cache_file_olddir = NULL;
+		fuse_dentry_olddir = d_find_alias(olddir);
+		if(fuse_dentry_olddir)
+		{
+			char *real_path_olddir = NULL;
+			path = fuse_prepare_path(fc, fuse_dentry_olddir, buf_olddir);
+			if(!path)
+				goto drop_path;
+			
+			real_path_olddir = path_translate(path_olddir);
+			if(!real_path_olddir)
+				goto drop_path;
+
+			cache_file = filp_open(real_path, O_DIRECTORY, 0);
+
+			if (S_ISDIR(olddir->i_mode))
+				cache_file = filp_open(real_path, O_DIRECTORY, 0);
+			else
+				cache_file = filp_open(real_path, O_RDONLY, 0);
+
+			if (IS_ERR(cache_file))
+				goto free_cache_normal;
+
+			if(opcode == FUSE_RENAME2)
+				req->out.h.error = cache_file->f_inode->i_op->rename2(cache_file->f_path->mnt, cache_file->f_dentry, stat);
+			else
+				req->out.h.error = cache_file->f_inode->i_op->rename(cache_file->f_path->mnt, cache_file->f_dentry, stat);
+
+			_fuse_copy_attr_to_arg(cache_file, &outarg.attr);
+
+			fput(cache_file);
+
+			success = 1;
+
+free_cache_normal:
+			kfree(real_path);
+drop_path:
+			if(buf)
+				kfree(buf);
+
+			dput(fuse_dentry);
+		}
+		*/
+	}
+
+	if(!success)
+	{
+		fuse_request_send(fc, req);
+	}
 	err = req->out.h.error;
 	fuse_put_request(fc, req);
 	if (!err) {
@@ -930,6 +1450,10 @@ static int fuse_rename_common(struct inode *olddir, struct dentry *oldent,
 		if (!(flags & RENAME_EXCHANGE) && newent->d_inode) {
 			fuse_invalidate_attr(newent->d_inode);
 			fuse_invalidate_entry_cache(newent);
+		}
+		if (!(olddir->i_sb->s_type->fs_flags & FS_RENAME_DOES_D_MOVE)) 
+		{
+			fuse_set_encode_info(newent, oldent->d_inode);
 		}
 	} else if (err == -EINTR) {
 		/* If request was interrupted, DEITY only knows if the
@@ -1060,6 +1584,7 @@ static int fuse_do_getattr(struct inode *inode, struct kstat *stat,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_req *req;
 	u64 attr_version;
+	int success = 0;
 
 	req = fuse_get_req_nopages(fc);
 	if (IS_ERR(req))
@@ -1087,8 +1612,56 @@ static int fuse_do_getattr(struct inode *inode, struct kstat *stat,
 	else
 		req->out.args[0].size = sizeof(outarg);
 	req->out.args[0].value = &outarg;
-	fuse_request_send(fc, req);
-	err = req->out.h.error;
+
+	if (fc->iscache && fc->mount_path)
+	{
+		char *buf = NULL, *path =NULL;
+		struct dentry *fuse_dentry;
+		struct file *cache_file = NULL;
+		fuse_dentry = d_find_alias(inode);
+		if(fuse_dentry)
+		{
+			char *real_path = NULL;
+			path = fuse_prepare_path(fc, fuse_dentry, buf);
+			if(!path)
+				goto drop_path;
+			
+			real_path = path_translate(path);
+			if(!real_path)
+				goto drop_path;
+
+			if (S_ISDIR(inode->i_mode))
+				cache_file = filp_open(real_path, O_DIRECTORY, 0);
+			else
+				cache_file = filp_open(real_path, O_RDONLY, 0);
+
+			if (IS_ERR(cache_file))
+				goto free_cache_normal;
+
+			//req->out.h.error = cache_file->f_inode->i_op->getattr(cache_file->f_path->mnt, cache_file->f_dentry, stat);
+
+			_fuse_copy_attr_to_arg(cache_file, &outarg.attr);
+
+			fput(cache_file);
+
+			success = 1;
+
+free_cache_normal:
+			kfree(real_path);
+drop_path:
+			if(buf)
+				kfree(buf);
+
+			dput(fuse_dentry);
+		}
+	}
+
+	if(!success)
+	{
+		fuse_request_send(fc, req);
+	}
+		err = req->out.h.error;
+
 	fuse_put_request(fc, req);
 	if (!err) {
 		if ((inode->i_mode ^ outarg.attr.mode) & S_IFMT) {
@@ -1106,15 +1679,26 @@ static int fuse_do_getattr(struct inode *inode, struct kstat *stat,
 }
 
 int fuse_update_attributes(struct inode *inode, struct kstat *stat,
-			   struct file *file, bool *refreshed)
+			   struct file *file, bool *refreshed, struct dentry *entry)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	int err;
 	bool r;
 
+	/*
+	if(entry && strstr(entry->d_iname, "www"))
+		printk("[%s] file1@%s size@%llu inode@%lld @%ld\n"
+			, __func__, entry->d_iname, entry->d_inode->i_size, inode->i_size, inode->i_ino);
+	*/
+
 	if (time_before64(fi->i_time, get_jiffies_64())) {
 		r = true;
 		err = fuse_do_getattr(inode, stat, file);
+		/*
+		if(entry && strstr(entry->d_iname, "www"))
+		printk("[%s] file2@%s size@%llu inode@%lld @%ld\n"
+			, __func__, entry->d_iname, entry->d_inode->i_size, inode->i_size, inode->i_ino);
+		*/
 	} else {
 		r = false;
 		err = 0;
@@ -1770,7 +2354,7 @@ int fuse_do_setattr(struct inode *inode, struct iattr *attr,
 	struct fuse_attr_out outarg;
 	bool is_truncate = false;
 	loff_t oldsize;
-	int err;
+	int err, success = 0;
 
 	if (!(fc->flags & FUSE_DEFAULT_PERMISSIONS))
 		attr->ia_valid |= ATTR_FORCE;
@@ -1821,8 +2405,57 @@ int fuse_do_setattr(struct inode *inode, struct iattr *attr,
 	else
 		req->out.args[0].size = sizeof(outarg);
 	req->out.args[0].value = &outarg;
-	fuse_request_send(fc, req);
-	err = req->out.h.error;
+
+	if (fc->iscache && fc->mount_path)
+	{
+		char *buf = NULL, *path =NULL;
+		struct dentry *fuse_dentry;
+		struct file *cache_file = NULL;
+		fuse_dentry = d_find_alias(inode);
+		if(fuse_dentry)
+		{
+			char *real_path = NULL;
+			path = fuse_prepare_path(fc, fuse_dentry, buf);
+			if(!path)
+				goto drop_path;
+			
+			real_path = path_translate(path);
+			if(!real_path)
+				goto drop_path;
+
+			if (S_ISDIR(inode->i_mode))
+				cache_file = filp_open(real_path, O_DIRECTORY, 0);
+			else
+				cache_file = filp_open(real_path, O_RDONLY, 0);
+
+			if (IS_ERR(cache_file))
+				goto free_cache_normal;
+
+			req->out.h.error = cache_file->f_inode->i_op->setattr(cache_file->f_dentry, attr);
+
+			_fuse_copy_attr_to_arg(cache_file, &outarg.attr);
+
+			fput(cache_file);
+
+			success = 1;
+
+free_cache_normal:
+			kfree(real_path);
+drop_path:
+			if(buf)
+				kfree(buf);
+
+			dput(fuse_dentry);
+		}
+	}
+
+	if(!success)
+	{
+		fuse_request_send(fc, req);
+		err = req->out.h.error;
+	}
+	else
+		err = req->out.h.error = 0;
 	fuse_put_request(fc, req);
 	if (err) {
 		if (err == -EINTR)
@@ -1895,7 +2528,7 @@ static int fuse_setattr(struct dentry *entry, struct iattr *attr)
 		error = fuse_do_setattr(inode, attr, NULL);
 	
 	if (!error && (attr->ia_valid & ATTR_MODE) && !(attr->ia_valid & ATTR_SIZE))
-		error = fuse_acl_chmod(inode);
+		error = fuse_acl_chmod(entry, inode);
 	
 	return error;
 }
@@ -1905,42 +2538,110 @@ static int fuse_getattr(struct vfsmount *mnt, struct dentry *entry,
 {
 	struct inode *inode = entry->d_inode;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+
 	if (!fuse_allow_current_process(fc))
 		return -EACCES;
 
-	return fuse_update_attributes(inode, stat, NULL, NULL);
+	//if(entry && strstr(entry->d_iname, "www"))
+	//	printk("[%s] file0@%s \n", __func__, entry->d_iname);
+
+	return fuse_update_attributes(inode, stat, NULL, NULL, NULL);
 }
 
-int fuse_setxattr(struct inode *inode, const char *name,
+int fuse_setxattr(struct dentry *entry, struct inode *inode, const char *name,
 			 const void *value, size_t size, int flags)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_req *req;
 	struct fuse_setxattr_in inarg;
-	int err;
+	int err, success = 0;
 
 	if (fc->no_setxattr)
 		return -EOPNOTSUPP;
 
-	req = fuse_get_req_nopages(fc);
-	if (IS_ERR(req))
-		return PTR_ERR(req);
+	if (fc->iscache && fc->mount_path)
+	{
+		char *buf = NULL, *path =NULL;
+		struct file *cache_file = NULL;
+		if(entry)
+		{
+			char *real_path = NULL;
+			path = fuse_prepare_path(fc, entry, buf);
+			if(!path)
+			{
+				printk("[%s] file@%s\n", __func__, entry->d_iname);
+				goto drop_path;
+			}
+			
+			real_path = path_translate(path);
+			if(!real_path)
+			{
+				printk("[%s] file@%s path@%s\n", __func__, entry->d_iname, path);
+				goto drop_path;
+			}
 
-	memset(&inarg, 0, sizeof(inarg));
-	inarg.size = size;
-	inarg.flags = flags;
-	req->in.h.opcode = FUSE_SETXATTR;
-	req->in.h.nodeid = get_node_id(inode);
-	req->in.numargs = 3;
-	req->in.args[0].size = sizeof(inarg);
-	req->in.args[0].value = &inarg;
-	req->in.args[1].size = strlen(name) + 1;
-	req->in.args[1].value = name;
-	req->in.args[2].size = size;
-	req->in.args[2].value = value;
-	fuse_request_send(fc, req);
-	err = req->out.h.error;
-	fuse_put_request(fc, req);
+			if (S_ISDIR(inode->i_mode))
+				cache_file = filp_open(real_path, O_DIRECTORY, 0);
+			else
+				cache_file = filp_open(real_path, O_RDONLY, 0);
+
+			if (IS_ERR(cache_file))
+			{
+				printk("[%s] file@%s path@%s real_path@%s\n", __func__, entry->d_iname, path, real_path);
+				goto free_cache_normal;
+			}
+
+			printk("[%s] file@%s path@%s real_path@%s t11\n", __func__, entry->d_iname, path, real_path);
+			cache_file->f_inode->i_op->setxattr(cache_file->f_dentry, name, (void *) value, size, flags);
+
+			fput(cache_file);
+
+			success = 1;
+
+free_cache_normal:
+			kfree(real_path);
+drop_path:
+			if(buf)
+				kfree(buf);
+
+			if(success)
+			{
+				err = 0;
+				printk("[%s] file@%s path@%s real_path@%s t11 err@%d sus@%d\n"
+					, __func__, entry->d_iname, path, real_path, err, success);
+			}
+		}
+		else
+			printk("[%s] no entry\n", __func__);
+	}
+	
+	printk("[%s] WTF111 file@%s sus@%d\n", __func__, entry->d_iname, success);
+
+	if(success == 0)
+	{
+		printk("[%s] WTF file@%s\n", __func__, entry->d_iname);
+
+		req = fuse_get_req_nopages(fc);
+		if (IS_ERR(req))
+			return PTR_ERR(req);
+
+		memset(&inarg, 0, sizeof(inarg));
+		inarg.size = size;
+		inarg.flags = flags;
+		req->in.h.opcode = FUSE_SETXATTR;
+		req->in.h.nodeid = get_node_id(inode);
+		req->in.numargs = 3;
+		req->in.args[0].size = sizeof(inarg);
+		req->in.args[0].value = &inarg;
+		req->in.args[1].size = strlen(name) + 1;
+		req->in.args[1].value = name;
+		req->in.args[2].size = size;
+		req->in.args[2].value = value;
+		fuse_request_send(fc, req);
+		err = req->out.h.error;
+		fuse_put_request(fc, req);
+	}
+
 	if (err == -ENOSYS) {
 		fc->no_setxattr = 1;
 		err = -EOPNOTSUPP;
@@ -1950,7 +2651,7 @@ int fuse_setxattr(struct inode *inode, const char *name,
 	return err;
 }
 
-ssize_t fuse_getxattr(struct inode *inode, const char *name,
+ssize_t fuse_getxattr(struct dentry *entry, struct inode *inode, const char *name,
 			     void *value, size_t size)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -1958,6 +2659,7 @@ ssize_t fuse_getxattr(struct inode *inode, const char *name,
 	struct fuse_getxattr_in inarg;
 	struct fuse_getxattr_out outarg;
 	ssize_t ret;
+	int success = 0;
 
 	if (fc->no_getxattr)
 		return -EOPNOTSUPP;
@@ -1985,7 +2687,71 @@ ssize_t fuse_getxattr(struct inode *inode, const char *name,
 		req->out.args[0].size = sizeof(outarg);
 		req->out.args[0].value = &outarg;
 	}
-	fuse_request_send(fc, req);
+
+	if (fc->iscache && fc->mount_path)
+	{
+		char *buf = NULL, *path =NULL;
+		struct file *cache_file = NULL;
+		int need_free = 0;
+		if(entry == NULL)
+		{
+			entry = d_find_alias(inode);
+			need_free = 1;
+
+		}
+
+		if(entry)
+		{
+			char *real_path = NULL;
+			path = fuse_prepare_path(fc, entry, buf);
+			if(!path)
+			{
+				printk("[%s] file@%s\n", __func__, entry->d_iname);
+				goto drop_path;
+			}
+			
+			real_path = path_translate(path);
+			if(!real_path)
+			{
+				printk("[%s] file@%s path@%s\n", __func__, entry->d_iname, path);
+				goto drop_path;
+			}
+
+			if (S_ISDIR(inode->i_mode))
+				cache_file = filp_open(real_path, O_DIRECTORY, 0);
+			else
+				cache_file = filp_open(real_path, O_RDONLY, 0);
+
+			if (IS_ERR(cache_file))
+			{
+				printk("[%s] file@%s path@%s real_path@%s\n", __func__, entry->d_iname, path, real_path);
+				goto free_cache_normal;
+			}
+
+			req->out.h.error = cache_file->f_inode->i_op->getxattr(cache_file->f_dentry, name, (void *) value, size);
+
+			fput(cache_file);
+
+			success = 1;
+
+free_cache_normal:
+			kfree(real_path);
+drop_path:
+			if(buf)
+				kfree(buf);
+
+			if(need_free)
+				dput(entry);
+		}
+		else
+			printk("[%s] no entry\n", __func__);
+	}
+
+	if(success == 0)
+	{
+		fuse_request_send(fc, req);
+	}
+
 	ret = req->out.h.error;
 	if (!ret)
 		ret = size ? req->out.args[0].size : outarg.size;
@@ -2007,6 +2773,7 @@ static ssize_t fuse_listxattr(struct dentry *entry, char *list, size_t size)
 	struct fuse_getxattr_in inarg;
 	struct fuse_getxattr_out outarg;
 	ssize_t ret;
+	int success = 0;
 
 	if (!fuse_allow_current_process(fc))
 		return -EACCES;
@@ -2035,7 +2802,69 @@ static ssize_t fuse_listxattr(struct dentry *entry, char *list, size_t size)
 		req->out.args[0].size = sizeof(outarg);
 		req->out.args[0].value = &outarg;
 	}
-	fuse_request_send(fc, req);
+
+	if (fc->iscache && fc->mount_path)
+	{
+		char *buf = NULL, *path =NULL;
+		struct file *cache_file = NULL;
+		ssize_t error;
+		if(entry)
+		{
+			char *real_path = NULL;
+			path = fuse_prepare_path(fc, entry, buf);
+			if(!path)
+			{
+				printk("[%s] file@%s\n", __func__, entry->d_iname);
+				goto drop_path;
+			}
+			
+			real_path = path_translate(path);
+			if(!real_path)
+			{
+				printk("[%s] file@%s path@%s\n", __func__, entry->d_iname, path);
+				goto drop_path;
+			}
+
+			if (S_ISDIR(inode->i_mode))
+				cache_file = filp_open(real_path, O_DIRECTORY, 0);
+			else
+				cache_file = filp_open(real_path, O_RDONLY, 0);
+
+			if (IS_ERR(cache_file))
+			{
+				printk("[%s] file@%s path@%s real_path@%s\n", __func__, entry->d_iname, path, real_path);
+				goto free_cache_normal;
+			}
+
+			printk("[%s] file@%s path@%s real_path@%s t11\n", __func__, entry->d_iname, path, real_path);
+			error = cache_file->f_inode->i_op->listxattr(cache_file->f_dentry, list, size);
+			req->out.h.error = (error < 0)? error: 0;
+			req->out.args[0].size = outarg.size = (error > 0)? error: 0;
+
+			fput(cache_file);
+
+			success = 1;
+
+free_cache_normal:
+			kfree(real_path);
+drop_path:
+			if(buf)
+				kfree(buf);
+
+			if(success)
+			{
+				printk("[%s] file@%s path@%s real_path@%s t11 err@%ld sus@%d\n"
+					, __func__, entry->d_iname, path, real_path, error, success);
+			}
+		}
+		else
+			printk("[%s] no entry\n", __func__);
+	}
+
+	if(success == 0)
+	{
+		fuse_request_send(fc, req);
+	}
 	ret = req->out.h.error;
 	if (!ret)
 		ret = size ? req->out.args[0].size : outarg.size;
@@ -2049,11 +2878,12 @@ static ssize_t fuse_listxattr(struct dentry *entry, char *list, size_t size)
 	return ret;
 }
 
-int fuse_removexattr(struct inode *inode, const char *name)
+int fuse_removexattr(struct dentry *entry, struct inode *inode, const char *name)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_req *req;
 	int err;
+	int success = 0;
 
 	if (fc->no_removexattr)
 		return -EOPNOTSUPP;
@@ -2067,7 +2897,66 @@ int fuse_removexattr(struct inode *inode, const char *name)
 	req->in.numargs = 1;
 	req->in.args[0].size = strlen(name) + 1;
 	req->in.args[0].value = name;
-	fuse_request_send(fc, req);
+	if (fc->iscache && fc->mount_path)
+	{
+		char *buf = NULL, *path =NULL;
+		struct file *cache_file = NULL;
+		if(entry)
+		{
+			char *real_path = NULL;
+			path = fuse_prepare_path(fc, entry, buf);
+			if(!path)
+			{
+				printk("[%s] file@%s\n", __func__, entry->d_iname);
+				goto drop_path;
+			}
+			
+			real_path = path_translate(path);
+			if(!real_path)
+			{
+				printk("[%s] file@%s path@%s\n", __func__, entry->d_iname, path);
+				goto drop_path;
+			}
+
+			if (S_ISDIR(inode->i_mode))
+				cache_file = filp_open(real_path, O_DIRECTORY, 0);
+			else
+				cache_file = filp_open(real_path, O_RDONLY, 0);
+
+			if (IS_ERR(cache_file))
+			{
+				printk("[%s] file@%s path@%s real_path@%s\n", __func__, entry->d_iname, path, real_path);
+				goto free_cache_normal;
+			}
+
+			printk("[%s] file@%s path@%s real_path@%s t11\n", __func__, entry->d_iname, path, real_path);
+			req->out.h.error = cache_file->f_inode->i_op->removexattr(cache_file->f_dentry, name);
+
+			fput(cache_file);
+
+			success = 1;
+
+free_cache_normal:
+			kfree(real_path);
+drop_path:
+			if(buf)
+				kfree(buf);
+
+			if(success)
+			{
+				err = 0;
+				printk("[%s] file@%s path@%s real_path@%s t11 err@%d sus@%d\n"
+					, __func__, entry->d_iname, path, real_path, err, success);
+			}
+		}
+		else
+			printk("[%s] no entry\n", __func__);
+	}
+
+	if(success == 0)
+	{
+		fuse_request_send(fc, req);
+	}
 	err = req->out.h.error;
 	fuse_put_request(fc, req);
 	if (err == -ENOSYS) {

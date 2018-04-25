@@ -953,7 +953,7 @@ static fuse_ino_t next_id(struct fuse *f)
 	return f->ctr;
 }
 
-static int is_yas3(struct fuse *f)
+int is_yas3(struct fuse *f)
 {
 	
 	if (f->fs && f->fs->fsname && strcmp(f->fs->fsname, "yas3fs") == 0)
@@ -2797,7 +2797,7 @@ static void fuse_delete_context_key(void)
 	pthread_mutex_unlock(&fuse_context_lock);
 }
 
-static struct fuse *req_fuse_prepare(fuse_req_t req)
+struct fuse *req_fuse_prepare(fuse_req_t req)
 {
 	struct fuse_context_i *c = fuse_get_context_internal();
 	const struct fuse_ctx *ctx = fuse_req_ctx(req);
@@ -4300,6 +4300,51 @@ static void fuse_lib_bmap(fuse_req_t req, fuse_ino_t ino, size_t blocksize,
 		reply_err(req, err);
 }
 
+static void fuse_lib_ioctl_special(fuse_req_t req, char *path, int cmd, void *arg,
+			   struct fuse_file_info *fi, unsigned int flags,
+			   const void *in_buf, size_t in_bufsz,
+			   size_t out_bufsz)
+{
+	struct fuse *f = req_fuse_prepare(req);
+	struct fuse_intr_data d;
+	char * *out_buf = NULL;
+	int err;
+
+	err = -EPERM;
+	if (flags & FUSE_IOCTL_UNRESTRICTED)
+		goto err;
+
+	if (out_bufsz) {
+		err = -ENOMEM;
+		out_buf = malloc(out_bufsz);
+		if (!out_buf)
+			goto err;
+	}
+	yase_logs("[fuse_lib_ioctl_special] 1path@%s out_bufsz@%d\n", path, out_bufsz);
+	assert(!in_bufsz || !out_bufsz || in_bufsz == out_bufsz);
+	if (out_buf)
+		memcpy(out_buf, in_buf, in_bufsz);
+	yase_logs("[fuse_lib_ioctl_special] 2path@%s\n", path);
+	fuse_prepare_interrupt(f, req, &d);
+
+	yase_logs("[fuse_lib_ioctl_special] 3path@%s\n", path);
+	err = fuse_fs_ioctl(f->fs, path, cmd, arg, fi, flags,
+			    out_buf ?: (void *)in_buf);
+	yase_logs("[fuse_lib_ioctl_special] 4path@%s\n", path);
+	fuse_finish_interrupt(f, req, &d);
+
+	yase_logs("[fuse_lib_ioctl_special] 5path@%s\n", path);
+	fuse_reply_ioctl(req, err, out_buf, out_bufsz);
+	yase_logs("[fuse_lib_ioctl_special] 6path@%s\n", path);
+	goto out;
+err:
+	reply_err(req, err);
+out:
+	yase_logs("[fuse_lib_ioctl_special] 7path@%s\n", path);
+	free(out_buf);
+	yase_logs("[fuse_lib_ioctl_special] 8path@%s\n", path);
+}
+
 static void fuse_lib_ioctl(fuse_req_t req, fuse_ino_t ino, int cmd, void *arg,
 			   struct fuse_file_info *fi, unsigned int flags,
 			   const void *in_buf, size_t in_bufsz,
@@ -4480,6 +4525,7 @@ static struct fuse_lowlevel_ops fuse_path_ops = {
 	.flock = fuse_lib_flock,
 	.bmap = fuse_lib_bmap,
 	.ioctl = fuse_lib_ioctl,
+	.ioctl_special = fuse_lib_ioctl_special,
 	.poll = fuse_lib_poll,
 	.fallocate = fuse_lib_fallocate,
 };

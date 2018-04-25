@@ -196,6 +196,8 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 		inode->i_mode &= ~S_ISVTX;
 
 	fi->orig_ino = attr->ino;
+
+	attr->size = (inode->i_size > 0)? inode->i_size: attr->size;
 }
 
 void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
@@ -215,6 +217,15 @@ void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
 
 	old_mtime = inode->i_mtime;
 	fuse_change_attributes_common(inode, attr, attr_valid);
+
+	/*
+	if(attr->size == 0 && inode->i_ino != 0)
+	{
+		printk("[%s] size@%llu inode@%lld @%ld\n"
+		, __func__, attr->size, inode->i_size, inode->i_ino);
+		dump_stack();
+	}
+	*/
 
 	oldsize = inode->i_size;
 	i_size_write(inode, attr->size);
@@ -424,7 +435,7 @@ static int fuse_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct fuse_conn *fc = get_fuse_conn_super(sb);
 	struct fuse_req *req;
 	struct fuse_statfs_out outarg;
-	int err;
+	int err, success = 0;
 
 	if (!fuse_allow_current_process(fc)) {
 		buf->f_type = FUSE_SUPER_MAGIC;
@@ -443,10 +454,78 @@ static int fuse_statfs(struct dentry *dentry, struct kstatfs *buf)
 	req->out.args[0].size =
 		fc->minor < 4 ? FUSE_COMPAT_STATFS_SIZE : sizeof(outarg);
 	req->out.args[0].value = &outarg;
-	fuse_request_send(fc, req);
+
+	if (fc->iscache && fc->mount_path)
+	{
+		char *buf_path = NULL, *path =NULL;
+		struct file *cache_file = NULL;
+		int need_free = 0;
+		struct dentry *entry = dentry;
+		if(entry == NULL)
+		{
+			entry = d_find_alias(dentry->d_inode);
+			need_free = 1;
+
+		}
+
+		if(entry)
+		{
+			char *real_path = NULL;
+			path = fuse_prepare_path(fc, entry, buf_path);
+			if(!path)
+			{
+				printk("[%s] file@%s\n", __func__, entry->d_iname);
+				goto drop_path;
+			}
+			
+			real_path = path_translate(path);
+			if(!real_path)
+			{
+				printk("[%s] file@%s path@%s\n", __func__, entry->d_iname, path);
+				goto drop_path;
+			}
+
+			if (S_ISDIR(dentry->d_inode->i_mode))
+				cache_file = filp_open(real_path, O_DIRECTORY, 0);
+			else
+				cache_file = filp_open(real_path, O_RDONLY, 0);
+
+			if (IS_ERR(cache_file))
+			{
+				printk("[%s] file@%s path@%s real_path@%s\n", __func__, entry->d_iname, path, real_path);
+				goto free_cache_normal;
+			}
+
+			req->out.h.error = cache_file->f_dentry->d_sb->s_op->statfs(cache_file->f_dentry, buf);
+
+			fput(cache_file);
+
+			success = 1;
+
+free_cache_normal:
+			kfree(real_path);
+drop_path:
+			if(buf_path)
+				kfree(buf_path);
+
+			if(need_free)
+				dput(entry);
+		}
+		else
+			printk("[%s] no entry\n", __func__);
+	}
+
+	if(success == 0)
+	{
+		fuse_request_send(fc, req);
+	}
+
 	err = req->out.h.error;
 	if (!err)
-		convert_fuse_statfs(buf, &outarg.st);
+	{
+		if(!success)
+			convert_fuse_statfs(buf, &outarg.st);
+	}
 	fuse_put_request(fc, req);
 	return err;
 }
@@ -662,7 +741,7 @@ struct fuse_inode_handle {
 	u32 generation;
 };
 
-static char* path_translate(char *path)
+char* path_translate(char *path)
 {
 	char *nowptr = path;
 	char *cache_path = kmalloc(strlen(path)+8, GFP_KERNEL);
@@ -810,16 +889,56 @@ static struct dentry *fuse_get_dentry(struct super_block *sb,
 		strncpy(buf, fc->mount_path, length);
 		cPath = buf + length;
 
-		printk("length, %d cPath: %s \n", length, buf);
+		printk("[%s] length, %d cPath: %s name@%s id@%lu gen@%u buf@%s\n"
+			, __func__
+			, length, buf, xfs_dentry->d_iname, xfs_dentry->d_inode->i_ino
+			, xfs_dentry->d_inode->i_generation, buf);
 		ret = xfs_dentry->d_inode->i_op->getxattr(xfs_dentry, "user.whoami", (void *) cPath, PATH_MAX - length);
 		if (ret < 0)
 		{
+			char *path_buf = NULL, *tmp_path = NULL;
+			struct dentry *fuse_dentry = NULL;
+			int success = 0;
 			printk("[%s] path_translated@%s inodeID: %llu, gen: %u length, %d cPath: %s vfs_getxattr ret:%d\n"
 				, __func__, fc->mount_path_translated, handle->nodeid, handle->generation
 				, length, buf, ret);
-			dput(xfs_dentry);
-			kfree(buf);
-			goto close_d_normal;
+			
+			if(strcmp(xfs_dentry->d_iname, "/") == 0)
+			{
+				fuse_dentry = d_find_alias(xfs_dentry->d_inode);
+				printk("[%s] fuse_dentry@%s\n", __func__, fuse_dentry->d_iname);
+				if(strcmp(fuse_dentry->d_iname, "/") == 0)
+					goto drop_path;
+			}
+			
+			tmp_path = fuse_prepare_path(fc, (fuse_dentry)?fuse_dentry:xfs_dentry, path_buf);
+			if(!tmp_path)
+				goto drop_path;
+
+			printk("[%s] cPath@%s buf@%s tmp_path@%s\n", __func__, cPath, buf, tmp_path);
+
+			if(!(tmp_path = strstr(tmp_path, "files")))
+				goto drop_path;
+
+			tmp_path = tmp_path + 5;
+
+			memcpy(cPath, tmp_path, strlen(tmp_path));
+			success = 1;
+			printk("[%s] cPath@%s buf@%s\n", __func__, cPath, buf);
+
+drop_path:
+			if(path_buf)
+				kfree(path_buf);
+			if(fuse_dentry)
+				dput(fuse_dentry);
+		
+			if(!success)
+			{
+				dput(xfs_dentry);
+				kfree(buf);
+				goto close_d_normal;
+			}
+			
 		}
 
 		for (sleep_count = 0; sleep_count < 5; sleep_count++)
@@ -858,6 +977,8 @@ static struct dentry *fuse_get_dentry(struct super_block *sb,
 
 		fput(dfilp);
 		entry = d_obtain_alias(inode);
+
+		//printk("[%s] entry@%s ino@%lu gen@%u success\n", __func__, entry->d_iname, inode->i_ino, inode->i_generation);
 		
 		return entry;
 
@@ -877,7 +998,7 @@ normal_lookup:
 	name.len = 1;
 	name.name = ".";
 	err = fuse_lookup_name(sb, handle->nodeid, &name, &outarg,
-			       &inode);
+			       &inode, NULL, NULL);
 	if (err && err != -ENOENT)
 		goto out_err;
 	if (err || !inode) {
@@ -921,28 +1042,58 @@ static char* xfs_path_to_cache(char *path)
     return nowptr - 1;
 }
 
-static int fuse_encode_fh(struct inode *inode, u32 *fh, int *max_len,
-			   struct inode *parent)
+void fuse_set_encode_info(struct dentry *entry, struct inode *inode)
 {
-	
 	struct fuse_conn *fc = get_fuse_conn_super(inode->i_sb);
 	struct file *dfilp;
 	struct dentry *xfs_dentry;
-	char *buf, *path;
-	
-	int len = parent ? 6 : 3;
-	u64 nodeid;
-	u32 generation;
-
-	if (*max_len < len) {
-		*max_len = len;
-		return  FILEID_INVALID;
-	}
-
-	//printk("fuse_encode_fh\n");
+	char *buf = NULL, *path =NULL;
 
 	if (fc->iscache && fc->mount_path)
 	{
+		struct dentry *fuse_dentry;
+		struct file *cache_file = NULL;
+		fuse_dentry = (entry != NULL)? entry: d_find_alias(inode);
+		if(fuse_dentry)
+		{
+			char *real_path = NULL;
+			int success = 0;
+			path = fuse_prepare_path(fc, fuse_dentry, buf);
+			if(!path)
+				goto drop_path;
+			
+			real_path = path_translate(path);
+			if(!real_path)
+				goto drop_path;
+
+			if (S_ISDIR(inode->i_mode))
+				cache_file = filp_open(real_path, O_DIRECTORY, 0);
+			else
+				cache_file = filp_open(real_path, O_RDONLY, 0);
+
+			if (IS_ERR(cache_file))
+				goto free_cache_normal;
+
+			path = path + strlen(fc->mount_path);
+
+			cache_file->f_inode->i_op->setxattr(cache_file->f_dentry, "user.whoami", (void *) path, strlen(path), 0);
+
+			fput(cache_file);
+
+			success = 1;
+
+free_cache_normal:
+			kfree(real_path);
+drop_path:
+			if(buf)
+				kfree(buf);
+
+			dput(fuse_dentry);
+
+			if(success)
+				return;
+		}
+
 		//printk("fuse_encode_fh fuse enter\n");
 
 		if (!fc->mount_path_translated)
@@ -953,11 +1104,11 @@ static int fuse_encode_fh(struct inode *inode, u32 *fh, int *max_len,
 		{
 			printk("[%s] path_translated@%s inodeID@%lu, gen@%u open translated failed: %ld\n"
 				, __func__, fc->mount_path_translated, inode->i_ino, inode->i_generation, PTR_ERR(dfilp));
-			goto if_out;
+			return;
 		}
 
 		if (!dfilp->f_op->get_dentry)
-			goto if_out;
+			return;
 
 		xfs_dentry = dfilp->f_op->get_dentry(dfilp, inode->i_ino, inode->i_generation);
 		if (xfs_dentry == NULL)
@@ -991,6 +1142,7 @@ static int fuse_encode_fh(struct inode *inode, u32 *fh, int *max_len,
 		}
 
 		xfs_dentry->d_inode->i_op->setxattr(xfs_dentry, "user.whoami", (void *) path, strlen(path), 0);
+		printk("[%s] test start222 path@%s success\n", __func__, path);
 		
 	
 free_out:	
@@ -1002,7 +1154,21 @@ dput_out:
 fput_out:
 	fput(dfilp);
 	}
-if_out:
+}
+
+static int fuse_encode_fh(struct inode *inode, u32 *fh, int *max_len,
+			   struct inode *parent)
+{	
+	int len = parent ? 6 : 3;
+	u64 nodeid;
+	u32 generation;
+
+	fuse_set_encode_info(NULL, inode);
+
+	if (*max_len < len) {
+		*max_len = len;
+		return  FILEID_INVALID;
+	}
 
 	nodeid = get_fuse_inode(inode)->nodeid;
 	generation = inode->i_generation;
@@ -1199,20 +1365,18 @@ EXIT:
 void free_shared_bucket_list(struct list_head *shared_bucket_list){
 	shared_bucket_sub_t *sub_Pos;
 	shared_bucket_mnt_t *mnt_Pos;
-	struct list_head *pos1, *pos2, *q, *r;
 
-	list_for_each_safe(pos1, q, shared_bucket_list) {
-		mnt_Pos = list_entry(pos1, shared_bucket_mnt_t, mnt_list);
-		if(!list_empty(mnt_Pos->sub_list)) {
-			list_for_each_safe(pos2, r, mnt_Pos->sub_list) {
-				sub_Pos = list_entry(pos2, shared_bucket_sub_t, sub_list);
+	list_for_each_entry(mnt_Pos, shared_bucket_list, mnt_list){
+		// free sub list
+		if(!list_empty(mnt_Pos->sub_list)){
+			list_for_each_entry(sub_Pos, mnt_Pos->sub_list, sub_list){
 				list_del(&(sub_Pos->sub_list));
 			    kfree(sub_Pos);
 			}
 		}
 		// free mnt node
 		list_del(&(mnt_Pos->mnt_list));
-		kfree(mnt_Pos);		
+		kfree(mnt_Pos);
 	}
 }
 
@@ -1259,8 +1423,9 @@ static struct dentry *fuse_get_parent(struct dentry *child)
 
 	name.len = 2;
 	name.name = "..";
+	printk("[%s] child@%s\n", __func__, child->d_iname);
 	err = fuse_lookup_name(child_inode->i_sb, get_node_id(child_inode),
-			       &name, &outarg, &inode);
+			       &name, &outarg, &inode, NULL, child);
 	if (err) {
 		if (err == -ENOENT)
 			return ERR_PTR(-ESTALE);

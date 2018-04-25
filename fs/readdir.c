@@ -41,7 +41,7 @@ int vfs_readdir(struct file *file, filldir_t filler, void *buf)
 	if (!file->f_op || !file->f_op->readdir)
 		goto out;
 
-	if (inode->i_op->check_cache && inode->i_op->check_cache(inode) == 1)
+	if (inode->i_op->check_cache && inode->i_op->check_cache(inode) == 1) //
 	{
 		lastoff = (char *) kmalloc(YAS3FS_LSBUFFER_MAX + 1, GFP_KERNEL);
 

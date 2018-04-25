@@ -917,6 +917,9 @@ struct fuse_lowlevel_ops {
 	 * @param in_bufsz number of fetched bytes
 	 * @param out_bufsz maximum size of output data
 	 */
+	void (*ioctl_special) (fuse_req_t req, char *path, int cmd, void *arg,
+		       struct fuse_file_info *fi, unsigned flags,
+		       const void *in_buf, size_t in_bufsz, size_t out_bufsz);
 	void (*ioctl) (fuse_req_t req, fuse_ino_t ino, int cmd, void *arg,
 		       struct fuse_file_info *fi, unsigned flags,
 		       const void *in_buf, size_t in_bufsz, size_t out_bufsz);
